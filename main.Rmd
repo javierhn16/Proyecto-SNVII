@@ -1,0 +1,11 @@
+---
+title: "main"
+output: html_document
+---
+
+```{r}
+load("data/ausautoBI8999.rda")
+colSums(is.na(ausautoBI8999))
+```
+
+
