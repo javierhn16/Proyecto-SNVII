@@ -4,8 +4,38 @@ output: html_document
 ---
 
 ```{r}
+pacman::p_load(
+  tidyverse
+)
+```
+
+
+```{r}
 load("data/ausautoBI8999.rda")
 colSums(is.na(ausautoBI8999))
 ```
 
+```{r}
+data <- ausautoBI8999 %>% 
+  select(-c(4:7, 9:12)) %>% 
+  filter(AccDate > as.Date("1992-12-31"))
+```
+
+```{r}
+  datos_inc <- data %>%
+    mutate(ocurrencia = year(AccDate),
+           reporte = year(ReportDate),
+           k  = pmax(0, reporte - ocurrencia)) %>%
+    group_by(ocurrencia, k) %>%
+    summarise(inc = sum(AggClaim, na.rm = TRUE), .groups = "drop")
+  
+  ocurrencias <- sort(unique(datos_inc$ocurrencia))
+  Kmax <- max(datos_inc$k, na.rm = TRUE)
+  triangulo <- pivot_wider(datos_inc, names_from = k, values_from = inc, values_fill = 0) %>%
+    arrange(ocurrencia)
+  triangulo <- data.frame(triangulo)
+  rownames(triangulo) <- triangulo[, 1]  
+  triangulo <- triangulo[, -1]           
+  colnames(triangulo) <- 0:Kmax
+```
 
