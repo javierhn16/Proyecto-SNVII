@@ -7,7 +7,7 @@ output: html_document
 pacman::p_load(tidyverse, lubridate, ggplot2, scales)
 ```
 
-```{r}
+```{r,message=FALSE}
 data <- read_csv("data/ausautoBI8999.csv") %>%
   mutate(
     AccDate = as.Date(AccDate),
@@ -15,17 +15,10 @@ data <- read_csv("data/ausautoBI8999.csv") %>%
     FinDate = as.Date(FinDate),
     delay = as.numeric(ReportDate - AccDate),
     duration = as.numeric(FinDate - AccDate)
-  )
-
-colSums(is.na(data))
+  ) %>%
+  select(-c(4:6,8:14))
 ```
-```{r}
-summary(select(data, OpTime, AggClaim, InjNb, delay, duration))
 
-# Conteo de variables categóricas
-table(data$Legal)
-table(data$InjType1)
-```
 ```{r}
 ggplot(data, aes(x = AggClaim)) +
   geom_histogram(fill = "#0073C2FF", color = "white", bins = 50) +
@@ -35,28 +28,6 @@ ggplot(data, aes(x = AggClaim)) +
     x = "Monto del reclamo (escala log10)",
     y = "Frecuencia"
   ) +
-  theme_minimal()
-
-## --- Relación entre número de lesiones y monto del reclamo
-ggplot(data, aes(x = factor(InjNb), y = AggClaim)) +
-  geom_boxplot(fill = "#009E73") +
-  scale_y_log10(labels = comma) +
-  labs(
-    title = "Monto de reclamo según número de lesiones",
-    x = "Número de lesiones",
-    y = "Monto del reclamo (log10)"
-  ) +
-  theme_minimal()
-
-## --- Proporción de reclamos legales vs no legales
-ggplot(data, aes(x = Legal, fill = Legal)) +
-  geom_bar(width = 0.6, show.legend = FALSE) +
-  labs(
-    title = "Proporción de reclamos legales",
-    x = "Situación legal",
-    y = "Cantidad de reclamos"
-  ) +
-  scale_fill_manual(values = c("#E69F00", "#56B4E9")) +
   theme_minimal()
 
 ## --- Distribución del tiempo operativo (OpTime)
@@ -97,8 +68,7 @@ ggplot(data, aes(x = delay, y = AggClaim)) +
 ```
 
 ```{r}
-datos_inc <- data %>%
-  select(-c(4:7, 9:12)) %>%
+datos_sli <- data %>%
   filter(AccDate > as.Date("1992-12-31")) %>%
   mutate(
     ocurrencia = year(AccDate),
@@ -107,15 +77,13 @@ datos_inc <- data %>%
   ) %>%
   group_by(ocurrencia, k) %>%
   summarise(inc = sum(AggClaim, na.rm = TRUE), .groups = "drop")
-  
-  ocurrencias <- sort(unique(datos_inc$ocurrencia))
-  Kmax <- max(datos_inc$k, na.rm = TRUE)
-  triangulo <- pivot_wider(datos_inc, names_from = k, values_from = inc, values_fill = 0) %>%
+
+  triangulo <- pivot_wider(datos_sli, names_from = k, values_from = inc, values_fill = 0) %>%
     arrange(ocurrencia)
   triangulo <- data.frame(triangulo)
   rownames(triangulo) <- triangulo[, 1]  
   triangulo <- triangulo[, -1]           
-  colnames(triangulo) <- 0:Kmax
+  colnames(triangulo) <- 0:max(datos_sli$k, na.rm = TRUE)
 ```
 
 
