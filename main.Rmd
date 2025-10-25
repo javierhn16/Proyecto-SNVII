@@ -13,59 +13,59 @@ data <- read_csv("data/ausautoBI8999.csv") %>%
     AccDate = as.Date(AccDate),
     ReportDate = as.Date(ReportDate),
     FinDate = as.Date(FinDate),
-    delay = as.numeric(ReportDate - AccDate),
-    duration = as.numeric(FinDate - AccDate)
+    delay = as.numeric(ReportMth - AccMth),
+    duration = as.numeric(FinMth - AccMth)
   ) %>%
   select(-c(4:6,8:14))
 ```
 
 ```{r}
-ggplot(data, aes(x = AggClaim)) +
-  geom_histogram(fill = "#0073C2FF", color = "white", bins = 50) +
-  scale_x_log10(labels = comma) +
+fig <- ggplot(data, aes(x = log(AggClaim))) +
+  geom_density(color = "lightblue", size = 1.3, adjust = 1.2, fill = "lightblue") +
+  geom_histogram(aes(y = ..density..), 
+                 fill = "#0073C2FF", color = "white", bins = 50, alpha = 0.6) +
   labs(
-    title = "Distribución del monto agregado de reclamos (log)",
-    x = "Monto del reclamo (escala log10)",
-    y = "Frecuencia"
+    x = "Monto del reclamo (escala log)",
+    y = "Densidad"
   ) +
   theme_minimal()
+ggsave("res/densidad.pdf", fig, width = 8, height = 4)
+```
 
-## --- Distribución del tiempo operativo (OpTime)
-ggplot(data, aes(x = OpTime)) +
-  geom_histogram(bins = 40, fill = "#56B4E9", color = "white") +
-  labs(
-    title = "Distribución del tiempo operativo",
-    x = "OpTime",
-    y = "Frecuencia"
-  ) +
-  theme_minimal()
 
-## --- Evolución temporal de reclamos por fecha de accidente
-data %>%
+```{r, message=FALSE}
+fig <- data %>%
   mutate(month = floor_date(AccDate, "month")) %>%
   group_by(month) %>%
   summarise(Reclamos = n()) %>%
   ggplot(aes(x = month, y = Reclamos)) +
-  geom_line(color = "#D55E00", linewidth = 1) +
-  geom_point(color = "#D55E00", size = 1.5) +
+  geom_line(color = "#E69F00", linewidth = 1) +
+  geom_point(color = "#F17F00", size = 1.5) +
+  geom_smooth(method = "loess", se = FALSE, color = "#0072B2") +  
   labs(
-    title = "Evolución temporal de reclamos",
     x = "Fecha del accidente (mes)",
     y = "Número de reclamos"
   ) +
   theme_minimal()
+ggsave("res/evol.pdf", fig, width = 8, height = 4)
+```
 
-## --- Relación entre delay (reporte) y monto del reclamo
-ggplot(data, aes(x = delay, y = AggClaim)) +
-  geom_point(alpha = 0.3, color = "#0072B2") +
-  scale_y_log10(labels = comma) +
+
+```{r}
+fig <- ggplot(data, aes(x = log(AggClaim), y = OpTime)) +
+  geom_density_2d_filled(contour_var = "density", alpha = 0.85) +
+  scale_fill_manual(
+    values = colorRampPalette(c("#02102a", "#3182bd", "#fef0d9", "gray")[4:1])(13)
+  ) +
   labs(
-    title = "Relación entre días de retraso en reporte y monto del reclamo",
-    x = "Retraso (días entre accidente y reporte)",
-    y = "Monto del reclamo (log10)"
+    x = "Monto agregado del reclamo (escala log)",
+    y = "Tiempo operativo (OpTime)",
+    fill = "Densidad"
   ) +
   theme_minimal()
+ggsave("res/calor.pdf", fig, width = 8, height = 4)
 ```
+
 
 ```{r}
 datos_sli <- data %>%
