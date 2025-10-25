@@ -4,30 +4,109 @@ output: html_document
 ---
 
 ```{r}
-pacman::p_load(
-  tidyverse
-)
-```
-
-
-```{r}
-load("data/ausautoBI8999.rda")
-colSums(is.na(ausautoBI8999))
+pacman::p_load(tidyverse, lubridate, ggplot2, scales)
 ```
 
 ```{r}
-data <- ausautoBI8999 %>% 
-  select(-c(4:7, 9:12)) %>% 
-  filter(AccDate > as.Date("1992-12-31"))
+data <- read_csv("data/ausautoBI8999.csv") %>%
+  mutate(
+    AccDate = as.Date(AccDate),
+    ReportDate = as.Date(ReportDate),
+    FinDate = as.Date(FinDate),
+    delay = as.numeric(ReportDate - AccDate),
+    duration = as.numeric(FinDate - AccDate)
+  )
+
+colSums(is.na(data))
+```
+```{r}
+summary(select(data, OpTime, AggClaim, InjNb, delay, duration))
+
+# Conteo de variables categóricas
+table(data$Legal)
+table(data$InjType1)
+```
+```{r}
+ggplot(data, aes(x = AggClaim)) +
+  geom_histogram(fill = "#0073C2FF", color = "white", bins = 50) +
+  scale_x_log10(labels = comma) +
+  labs(
+    title = "Distribución del monto agregado de reclamos (log)",
+    x = "Monto del reclamo (escala log10)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+
+## --- Relación entre número de lesiones y monto del reclamo
+ggplot(data, aes(x = factor(InjNb), y = AggClaim)) +
+  geom_boxplot(fill = "#009E73") +
+  scale_y_log10(labels = comma) +
+  labs(
+    title = "Monto de reclamo según número de lesiones",
+    x = "Número de lesiones",
+    y = "Monto del reclamo (log10)"
+  ) +
+  theme_minimal()
+
+## --- Proporción de reclamos legales vs no legales
+ggplot(data, aes(x = Legal, fill = Legal)) +
+  geom_bar(width = 0.6, show.legend = FALSE) +
+  labs(
+    title = "Proporción de reclamos legales",
+    x = "Situación legal",
+    y = "Cantidad de reclamos"
+  ) +
+  scale_fill_manual(values = c("#E69F00", "#56B4E9")) +
+  theme_minimal()
+
+## --- Distribución del tiempo operativo (OpTime)
+ggplot(data, aes(x = OpTime)) +
+  geom_histogram(bins = 40, fill = "#56B4E9", color = "white") +
+  labs(
+    title = "Distribución del tiempo operativo",
+    x = "OpTime",
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+
+## --- Evolución temporal de reclamos por fecha de accidente
+data %>%
+  mutate(month = floor_date(AccDate, "month")) %>%
+  group_by(month) %>%
+  summarise(Reclamos = n()) %>%
+  ggplot(aes(x = month, y = Reclamos)) +
+  geom_line(color = "#D55E00", linewidth = 1) +
+  geom_point(color = "#D55E00", size = 1.5) +
+  labs(
+    title = "Evolución temporal de reclamos",
+    x = "Fecha del accidente (mes)",
+    y = "Número de reclamos"
+  ) +
+  theme_minimal()
+
+## --- Relación entre delay (reporte) y monto del reclamo
+ggplot(data, aes(x = delay, y = AggClaim)) +
+  geom_point(alpha = 0.3, color = "#0072B2") +
+  scale_y_log10(labels = comma) +
+  labs(
+    title = "Relación entre días de retraso en reporte y monto del reclamo",
+    x = "Retraso (días entre accidente y reporte)",
+    y = "Monto del reclamo (log10)"
+  ) +
+  theme_minimal()
 ```
 
 ```{r}
-  datos_inc <- data %>%
-    mutate(ocurrencia = year(AccDate),
-           reporte = year(ReportDate),
-           k  = pmax(0, reporte - ocurrencia)) %>%
-    group_by(ocurrencia, k) %>%
-    summarise(inc = sum(AggClaim, na.rm = TRUE), .groups = "drop")
+datos_inc <- data %>%
+  select(-c(4:7, 9:12)) %>%
+  filter(AccDate > as.Date("1992-12-31")) %>%
+  mutate(
+    ocurrencia = year(AccDate),
+    reporte = year(ReportDate),
+    k  = pmax(0, reporte - ocurrencia)
+  ) %>%
+  group_by(ocurrencia, k) %>%
+  summarise(inc = sum(AggClaim, na.rm = TRUE), .groups = "drop")
   
   ocurrencias <- sort(unique(datos_inc$ocurrencia))
   Kmax <- max(datos_inc$k, na.rm = TRUE)
@@ -38,4 +117,7 @@ data <- ausautoBI8999 %>%
   triangulo <- triangulo[, -1]           
   colnames(triangulo) <- 0:Kmax
 ```
+
+
+
 
