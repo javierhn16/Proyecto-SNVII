@@ -5,25 +5,44 @@ output: html_document
 
 # Lectura y librerías
 ```{r}
-pacman::p_load(tidyverse, lubridate, ggplot2, scales)
+pacman::p_load(
+  tidyverse,
+  lubridate, 
+  ggplot2, 
+  scales,
+  fitdistrplus,
+  copula,
+  zoo,
+  dplyr,
+  plotly,
+  ChainLadder
+)
 ```
 
 ```{r,message=FALSE}
-data <- read_csv("data/ausautoBI8999.csv") %>%
+data <- read.csv("data/ausautoBI8999.csv", stringsAsFactors = FALSE) %>%
+  arrange(AccMth) %>%
   mutate(
     AccDate = as.Date(AccDate),
     ReportDate = as.Date(ReportDate),
     FinDate = as.Date(FinDate),
-    delay = as.numeric(ReportMth - AccMth),
+    AccMth    = as.yearmon(AccMth, "%Y-%m"),
+    ReportMth = as.yearmon(ReportMth, "%Y-%m"),
+    FinMth    = as.yearmon(FinMth, "%Y-%m"),
+    delay = as.numeric((ReportMth - AccMth)),
     duration = as.numeric(FinMth - AccMth)
-  ) %>%
-  select(-c(4:6,8:14))
+  ) %>% 
+  filter(AccDate > as.Date("1992-12-31")) %>%
+  filter(AccDate < as.Date("1999-1-1")) %>%
+  filter(ReportDate < as.Date("1999-1-1")) %>%
+  filter(!is.na(delay), !is.na(duration), delay >= 0, duration >= 0) %>%
+  dplyr::select(-c(4:6,8:14))
 ```
 
 # AED
 ```{r}
 fig <- ggplot(data, aes(x = log(AggClaim))) +
-  geom_density(color = "lightblue", size = 1.3, adjust = 1.2, fill = "lightblue") +
+  geom_density(color = "lightblue", linewidth = 1.3, adjust = 1.2, fill = "lightblue") +
   geom_histogram(aes(y = ..density..), 
                  fill = "#0073C2FF", color = "white", bins = 50, alpha = 0.6) +
   labs(
@@ -66,9 +85,9 @@ fig <- ggplot(data, aes(x = log(AggClaim), y = OpTime)) +
 ggsave("res/calor.pdf", fig, width = 8, height = 4)
 ```
 
+# Chain Ladder
 ```{r}
 datos_sli <- data %>%
-  filter(AccDate > as.Date("1992-12-31")) %>%
   mutate(
     ocurrencia = year(AccDate),
     reporte = year(ReportDate),
@@ -85,16 +104,136 @@ datos_sli <- data %>%
   colnames(triangulo) <- 0:max(datos_sli$k, na.rm = TRUE)
 ```
 
+```{r}
+cumtria <- function(triangulo) {
+  n <- nrow(triangulo)
+  mask <- upper.tri(matrix(1, n, n), diag = T)[, n:1]
+  acum <- t(apply(triangulo, 1, cumsum)) * mask
+  acum[!mask] <- 0
+  acum <- data.frame(acum)
+  colnames(acum) <- 0:(n - 1)
+  return(acum)
+}
+```
+
+```{r}
+tria <- cumtria(triangulo)
+n <- nrow(tria)
+mask <- upper.tri(matrix(TRUE, n, n), diag = TRUE)[, n:1]  
+tria[!mask] <- NA 
+tria <- as.triangle(as.matrix(tria))
+CL <- MackChainLadder(tria)
+```
+
+```{r}
+(tria <- CL$FullTriangle)
+```
+
+```{r}
+CL$f
+```
+
+
+```{r}
+# Reserva
+sum(tria[,6]-diag(tria))
+```
+
+
 # Estimación por cópulas
 
+```{r}
+ggplot(data, aes(x = delay)) +
+  geom_histogram(aes(y = ..density..), bins = 40, fill = "steelblue", alpha = 0.7) +
+  stat_function(fun = dexp, args = list(rate = 1/mean(data$delay)), color = "red", size = 1) +
+  labs(title = "Delay (meses) vs Exponencial ajustada", x = "delay", y = "densidad")
+```
+
+```{r}
+ggplot(data, aes(x = duration)) +
+  geom_histogram(aes(y = ..density..), bins = 40, fill = "darkorange", alpha = 0.7) +
+  stat_function(fun = dexp, args = list(rate = 1/mean(data$duration)), color = "red", size = 1) +
+  labs(title = "Duration (meses) vs Exponencial ajustada", x = "duration", y = "densidad")
+```
+
+```{r}
+fit_delay <- fitdist(data$delay, "exp")
+fit_dur   <- fitdist(data$duration, "exp")
+
+lambda_delay <- fit_delay$estimate["rate"]
+lambda_dur   <- fit_dur$estimate["rate"]
+
+cat("Lambda_delay =", lambda_delay, "\n")
+cat("Lambda_dur   =", lambda_dur, "\n")
+```
+
+```{r}
+u <- pexp(data$duration, rate = lambda_dur)
+v <- pexp(data$delay, rate = lambda_delay)
+
+# --- 4. Ajustar cópula de Clayton ---
+clayton <- claytonCopula(dim = 2)
+fit_cop <- fitCopula(clayton, cbind(u, v), method = "ml")
+
+theta <- coef(fit_cop)  # parámetro de dependencia
+kendall_tau <- tau(fit_cop@copula)
+
+cat("\n--- Parámetros estimados ---\n")
+cat("λ1 (duration) =", lambda_dur, "\n")
+cat("λ2 (delay)    =", lambda_delay, "\n")
+cat("θ (Clayton)   =", theta, "\n")
+cat("Kendall's τ   =", kendall_tau, "\n")
+
+```
+
+```{r}
+set.seed(123)
+sim <- rCopula(10000, fit_cop@copula)
+
+sim_duration <- qexp(sim[,1], rate = lambda_dur)
+sim_delay    <- qexp(sim[,2], rate = lambda_delay)
+
+# umbral: máximo delay observado
+threshold <- max(data$delay)
+
+# proporción esperada de siniestros aún no reportados
+p_IBNR <- mean(sim_delay > threshold)
+
+cat("\nProporción estimada de siniestros IBNR:", round(p_IBNR, 4), "\n")
+```
 
 
+```{r}
+cop_df <- data.frame(
+  Duration = data$duration,
+  Delay = data$delay,
+  U = u,  # variable uniforme 1
+  V = v,
+  AggClaim = data$AggClaim
+)
 
+# --- 1. Visualización en espacio original (duration vs delay) ---
+fig1 <- plot_ly(cop_df, x = ~Duration, y = ~Delay, z = ~AggClaim,
+                type = "scatter3d", mode = "markers",
+                marker = list(size = 3, color = ~Delay, colorscale = "Viridis")) %>%
+  layout(scene = list(
+    xaxis = list(title = "Duration (meses entre ocurrencias)"),
+    yaxis = list(title = "Delay (meses de reporte)"),
+    zaxis = list(title = "Monto agregado (AggClaim)")
+  ))
+fig1
 
-
-
-
-
+# --- 2. (Alternativa) Visualización en espacio uniforme (U,V) ---
+fig2 <- plot_ly(cop_df, x = ~U, y = ~V, z = ~Delay,
+                type = "scatter3d", mode = "markers",
+                marker = list(size = 3, color = ~V, colorscale = "Cividis")) %>%
+  layout(scene = list(
+    xaxis = list(title = "F(duration)"),
+    yaxis = list(title = "F(delay)"),
+    zaxis = list(title = "Delay (meses)")
+  ))
+fig2
+```
 
 
 
