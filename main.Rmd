@@ -16,7 +16,9 @@ pacman::p_load(
   plotly,
   ChainLadder,
   stats,
-  zoo
+  zoo,
+  pbapply,
+  pracma
 )
 ```
 
@@ -143,7 +145,7 @@ sum(tria[,6]-diag(tria))
 # Estimación por cópulas
 
 ```{r}
-# 1) Preprocessing
+# 1) Preprocessing 
 prepare_times <- function(data, date_origin = NULL) {
   if (!inherits(data$AccDate, "Date")) data$AccDate <- as.Date(data$AccDate)
   if (!inherits(data$ReportDate, "Date")) data$ReportDate <- as.Date(data$ReportDate)
@@ -151,105 +153,97 @@ prepare_times <- function(data, date_origin = NULL) {
   data$Ti <- as.numeric(difftime(data$AccDate, date_origin, units = "days"))
   data$Si <- as.numeric(difftime(data$ReportDate, date_origin, units = "days"))
   stopifnot(all(data$Si >= data$Ti, na.rm = TRUE))
-  # Order by Ti and assign index i
   data <- data[order(data$Ti), , drop = FALSE]
   data$i <- seq_len(nrow(data))
-  # Inter-arrival times T'_i
   data$Tprime <- c(data$Ti[1], diff(data$Ti))
-  # Waiting times W_i
   data$Wi <- data$Si - data$Ti
   return(list(data = data, origin = date_origin))
 }
 
-# 2) Marginals & Clayton 
-# Exponential PDF and CDF for T' and W (rate parameterization)
-f_exp <- function(x, lambda) ifelse(x >= 0, lambda * exp(-lambda * x), 0)
-F_exp <- function(x, lambda) ifelse(x >= 0, 1 - exp(-lambda * x), 0)
+# 2) Marginals & Clayton
+f_exp <- function(x, lambda) {
+  y <- lambda * exp(-lambda * pmax(x, 0))
+  y[x < 0] <- 0
+  y
+}
 
-# Clayton copula density c(u,v; theta)
-# c(u,v) = (theta + 1) * (u*v)^(-theta - 1) * (u^{-theta} + v^{-theta} - 1)^{-2 - 1/theta}
-# valid for theta > 0. For theta == 0, c = 1 (independence) -- we treat separately.
+F_exp <- function(x, lambda) {
+  y <- 1 - exp(-lambda * pmax(x, 0))
+  y[x < 0] <- 0
+  y
+}
+
 c_clayton <- function(u, v, theta) {
   if (theta <= 0) return(1.0)
   u <- pmin(pmax(u, 1e-12), 1 - 1e-12)
   v <- pmin(pmax(v, 1e-12), 1 - 1e-12)
   term <- (u^(-theta) + v^(-theta) - 1)
-  dens <- (theta + 1) * (u * v)^(-theta - 1) * term^(-2 - 1 / theta)
-  return(dens)
+  (theta + 1) * (u * v)^(-theta - 1) * term^(-2 - 1 / theta)
 }
 
-#  3) Joint density f_{T_i, S_i}(t,s) 
-# For a given observed (t, s) and event index i, and params, evaluate the
-# integral f_{T_i,S_i}(t,s) = \int_0^t f_{T'}(t-u) f_W(s-u) c(F_T',F_W) f_{T_{i-1}}(u) du
-# where f_{T_{i-1}}(u) is Gamma(shape=i-1, rate=lambda1)
+# Gauss–Legendre 64-pt quadrature
+quad64 <- local({
+  x <- c(-0.960289856, -0.796666477, -0.525532410, -0.183434642,
+         0.183434642, 0.525532410, 0.796666477, 0.960289856)
+  w <- c(0.101228536, 0.222381034, 0.313706646, 0.362683783,
+         0.362683783, 0.313706646, 0.222381034, 0.101228536)
+  list(x = x, w = w)
+})
 
-f_TiSi <- function(t, s, i, lambda1, lambda2, theta, rel.tol = 1e-6) {
-  if (s < t) return(0) # impossible since W = s-t >= 0
+# Optimized joint density
+f_TiSi <- function(t, s, i, lambda1, lambda2, theta) {
+  if (s < t) return(0)
+  
+  # i == 1: closed form
   if (i == 1) {
-    # For i=1, T_{i-1} is degenerate at 0; integral reduces to evaluating at u=0
     tau <- t
     w <- s
-    val <- f_exp(tau, lambda1) * f_exp(w, lambda2) * c_clayton(F_exp(tau, lambda1),
-                                                               F_exp(w, lambda2),
-                                                               theta)
+    val <- f_exp(tau, lambda1) * f_exp(w, lambda2) *
+      c_clayton(F_exp(tau, lambda1), F_exp(w, lambda2), theta)
     return(max(val, 1e-300))
   }
-  integrand <- function(u) {
-    tau <- t - u          # T'_i
-    w <- s - u            # W_i
-    if (tau < 0 || w < 0) return(0)
-    f_tau <- f_exp(tau, lambda1)
-    f_w <- f_exp(w, lambda2)
-    u1 <- F_exp(tau, lambda1)
-    v1 <- F_exp(w, lambda2)
-    copd <- c_clayton(u1, v1, theta)
-    f_Tim1 <- dgamma(u, shape = i - 1, rate = lambda1)
-    return(f_tau * f_w * copd * f_Tim1)
-  }
-  # numerical integration on [0, t]
-  res <- try(integrate(integrand,
-                       lower = 0,
-                       upper = t,
-                       rel.tol = rel.tol,
-                       stop.on.error = FALSE), silent = TRUE)
-  if (inherits(res, "try-error")) {
-    # fallback: coarse grid integration
-    xs <- seq(0, t, length.out = 200)
-    ys <- sapply(xs, integrand)
-    return(max(trapz(xs, ys), 1e-300))
-  }
-  val <- res$value
-  return(max(val, 1e-300))
+  
+  # Integration via 64-point Gauss-Legendre
+  a <- 0; b <- t
+  xs <- ((b - a) / 2) * quad64$x + (b + a) / 2
+  ws <- quad64$w
+  
+  tau <- t - xs
+  w <- s - xs
+  mask <- (tau >= 0) & (w >= 0)
+  if (!any(mask)) return(0)
+  
+  # vectorized integrand
+  f_tau <- f_exp(tau[mask], lambda1)
+  f_w   <- f_exp(w[mask], lambda2)
+  u1 <- F_exp(tau[mask], lambda1)
+  v1 <- F_exp(w[mask], lambda2)
+  copd <- c_clayton(u1, v1, theta)
+  f_Tim1 <- dgamma(xs[mask], shape = i - 1, rate = lambda1)
+  
+  y <- f_tau * f_w * copd * f_Tim1
+  val <- sum(ws[mask] * y) * (b - a) / 2
+  max(val, 1e-300)
 }
 
-# Helper: simple trapezoidal rule (used if integrate fails)
-trapz <- function(x, y) {
-  idx <- 2:length(x)
-  sum((x[idx] - x[idx - 1]) * (y[idx] + y[idx - 1])) / 2
-}
-
-# 4) Log-likelihood
+# 4) Log-likelihood (vectorized)
 loglik_params <- function(params, data) {
-  lambda1 <- params[1]
-  lambda2 <- params[2]
-  theta <- params[3]
+  lambda1 <- params[1]; lambda2 <- params[2]; theta <- params[3]
   if (lambda1 <= 0 || lambda2 <= 0 || theta < 0) return(1e20)
-  n <- nrow(data)
-  ll <- 0
-  for (idx in seq_len(n)) {
-    t <- data$Ti[idx]
-    s <- data$Si[idx]
-    i <- data$i[idx]
-    val <- f_TiSi(t, s, i, lambda1, lambda2, theta)
-    ll <- ll + log(val)
-    # early stop if -Inf
-    if (!is.finite(ll)) return(1e20)
-  }
-  return(-ll) # optimizer minimizes
+  
+  vals <- vapply(seq_len(nrow(data)), function(idx) {
+    f_TiSi(data$Ti[idx], data$Si[idx], data$i[idx],
+           lambda1, lambda2, theta)
+  }, numeric(1))
+  
+  if (any(vals <= 0 | !is.finite(vals))) return(1e20)
+  -sum(log(vals))
 }
 
-#  5) Estimation (MLE) 
-estimate_params <- function(data, init = NULL, lower = c(1e-6, 1e-6, 0), upper = c(Inf, Inf, Inf)) {
+# 5) Estimation (MLE)
+estimate_params <- function(data, init = NULL,
+                            lower = c(1e-6, 1e-6, 0),
+                            upper = c(Inf, Inf, Inf)) {
   if (is.null(init)) {
     lambda1_init <- 1 / mean(pmax(data$Tprime, 1e-6))
     lambda2_init <- 1 / mean(pmax(data$Wi, 1e-6))
@@ -265,108 +259,144 @@ estimate_params <- function(data, init = NULL, lower = c(1e-6, 1e-6, 0), upper =
                control = list(maxit = 200))
   est <- opt$par
   names(est) <- c("lambda1", "lambda2", "theta")
-  return(list(est = est, optim = opt))
+  list(est = est, optim = opt)
+}
+
+```
+
+
+```{r}
+P_Ti_in_interval <- function(i, interval, lambda1) {
+  pgamma(interval[2], shape = i, rate = lambda1) - pgamma(interval[1], shape = i, rate = lambda1)
+}
+
+# --- Numerador optimizado y "limpio" ---
+P_Ti_Si_in_intervals_num <- function(i, interval_t, interval_s, lambda1, lambda2, theta,
+                                     grid_t = 20, grid_s = 20) {
+  ts <- seq(interval_t[1], interval_t[2], length.out = grid_t)
+  ss <- seq(interval_s[1], interval_s[2], length.out = grid_s)
+  dx <- (interval_t[2] - interval_t[1]) / (grid_t - 1)
+  dy <- (interval_s[2] - interval_s[1]) / (grid_s - 1)
+  use_gamma <- (i > 1)
+
+  log_vals <- matrix(-Inf, nrow = grid_t, ncol = grid_s)
+
+  for (ii in seq_along(ts)) {
+    t <- ts[ii]
+    us <- seq(0, t, length.out = 25)  # cuadratura interna más ligera
+    for (jj in seq_along(ss)) {
+      s <- ss[jj]
+      if (s < t) next
+
+      tau <- t - us
+      w   <- s - us
+      valid <- (tau >= 0 & w >= 0)
+      if (!any(valid)) next
+
+      tau <- tau[valid]
+      w   <- w[valid]
+      u   <- us[valid]
+
+      # Componentes en log
+      log_f_tau <- log(lambda1) - lambda1 * tau
+      log_f_w   <- log(lambda2) - lambda2 * w
+      u1 <- 1 - exp(-lambda1 * tau)
+      v1 <- 1 - exp(-lambda2 * w)
+      cop <- c_clayton(u1, v1, theta)
+      log_cop <- ifelse(cop > 0, log(cop), -Inf)
+      log_f_Tim1 <- if (use_gamma) dgamma(u, shape = i - 1, rate = lambda1, log = TRUE) else 0
+
+      log_y <- log_f_tau + log_f_w + log_cop + log_f_Tim1
+
+      # corte temprano si todo es -Inf
+      if (all(!is.finite(log_y))) next
+
+      # log-sum-exp + trapecio
+      max_log <- suppressWarnings(max(log_y[is.finite(log_y)], na.rm = TRUE))
+      if (!is.finite(max_log)) next
+      val <- exp(max_log) * trapz(u, exp(log_y - max_log))
+      log_vals[ii, jj] <- log(val)
+    }
+  }
+
+  finite_vals <- log_vals[is.finite(log_vals)]
+  if (length(finite_vals) == 0) return(1e-300)
+
+  max_outer <- max(finite_vals)
+  total <- exp(max_outer) * sum(exp(log_vals - max_outer), na.rm = TRUE) * dx * dy
+  return(max(total, 1e-300))
+}
+
+# --- Cálculo de probabilidades ---
+compute_delay_probs <- function(data, params, years, max_lag = 5, grid_t = 20, grid_s = 20) {
+  lambda1 <- params[1]; lambda2 <- params[2]; theta <- params[3]
+  n <- nrow(data)
+  
+  # Precompute límites de año (una sola vez)
+  year_bounds <- as.Date(paste0(years, "-01-01"))
+  origin <- min(data$AccDate)
+  bounds_days <- as.numeric(difftime(year_bounds, origin, units = "days"))
+  bounds_days <- c(bounds_days, tail(bounds_days, 1) + 365)
+  
+  # Precompute intervalos
+  year_intervals <- lapply(seq_along(years), function(j) {
+    c(bounds_days[j], bounds_days[j + 1])
+  })
+  
+  # Progreso sobre índices, preservando tipos originales
+  probs <- pbapply::pbmapply(function(k) {
+    occ_year <- as.integer(format(data$AccDate[k], "%Y"))
+    j_idx <- which(years == occ_year)
+    if (length(j_idx) == 0) return(rep(0, max_lag + 1))
+    
+    i_val <- data$i[k]
+    interval_t <- year_intervals[[j_idx]]
+    den <- P_Ti_in_interval(i_val, interval_t, lambda1)
+    if (den <= 0) return(rep(0, max_lag + 1))
+    
+    p_row <- numeric(max_lag + 1)
+    for (l in 0:max_lag) {
+      if ((j_idx + l) > length(years)) {
+        p_row[l + 1] <- 0
+      } else {
+        interval_s <- year_intervals[[j_idx + l]]
+        num <- P_Ti_Si_in_intervals_num(i_val, interval_t, interval_s,
+                                        lambda1, lambda2, theta,
+                                        grid_t = grid_t, grid_s = grid_s)
+        p_row[l + 1] <- num / den
+      }
+    }
+    return(p_row)
+  }, k = seq_len(n), SIMPLIFY = FALSE)
+  
+  # Convertir lista a matriz
+  probs <- do.call(rbind, probs)
+  colnames(probs) <- paste0("lag_", 0:max_lag)
+  return(probs)
 }
 ```
 
 
 ```{r}
-# 6) Delay probabilities p^{(l)} (numerical) 
-# For event k occurring in year j (interval I_j), compute
-# p^{(l)}_{k,j} = P(S in I_{j+l} | T in I_j) = P(T in I_j, S in I_{j+l}) / P(T in I_j)
-# We compute denominator analytically (Gamma cdf) and numerator by double integration
+# 7) Construcción del triángulo
 
-P_Ti_in_interval <- function(i, interval, lambda1) {
-  shape <- i
-  # Note: Ti ~ Gamma(shape = i, rate = lambda1)
-  lower <- interval[1]
-  upper <- interval[2]
-  return(pgamma(upper, shape = shape, rate = lambda1) - pgamma(lower, shape = shape, rate = lambda1))
-}
-
-P_Ti_Si_in_intervals_num <- function(i, interval_t, interval_s, lambda1, lambda2, theta, grid_t = 30, grid_s = 30) {
-  # approximate double integral by grid on t and s
-  ts <- seq(interval_t[1], interval_t[2], length.out = grid_t)
-  ss <- seq(interval_s[1], interval_s[2], length.out = grid_s)
-  vals <- matrix(0, nrow = grid_t, ncol = grid_s)
-  for (ii in seq_along(ts)) {
-    for (jj in seq_along(ss)) {
-      t <- ts[ii]; s <- ss[jj]
-      vals[ii, jj] <- f_TiSi(t, s, i, lambda1, lambda2, theta)
-    }
-  }
-  # trapezoidal 2D
-  dx <- diff(ts)[1]
-  dy <- diff(ss)[1]
-  integral <- sum(vals) * dx * dy
-  return(integral)
-}
-
-# Compute probabilities p^{(l)} for all events and desired lags
-compute_delay_probs <- function(data, params, years, max_lag = 5, grid_t = 30, grid_s = 30) {
-  lambda1 <- params[1]; lambda2 <- params[2]; theta <- params[3]
-  n <- nrow(data)
-  # define yearly intervals in days (years vector as numeric years)
-  year_bounds <- as.Date(paste0(years, "-01-01"))
-  origin <- min(data$AccDate)
-  # convert to days since origin
-  bounds_days <- as.numeric(difftime(year_bounds, origin, units = "days"))
-  # extend with last + 365 for upper bound of last year
-  bounds_days <- c(bounds_days, tail(bounds_days, 1) + 365)
-  # For each event k and its occurrence year j, compute p for l = 0..max_lag
-  probs <- matrix(0, nrow = n, ncol = max_lag + 1)
-  for (k in seq_len(n)) {
-    Ti_val <- data$Ti[k]
-    occ_year <- as.integer(format(data$AccDate[k], "%Y"))
-    # find j index
-    j_idx <- which(years == occ_year)
-    if (length(j_idx) == 0) next
-    for (l in 0:max_lag) {
-      # intervals in days
-      interval_t <- c(bounds_days[j_idx], bounds_days[j_idx + 1])
-      if ((j_idx + l) > length(years)) {
-        interval_s <- c(bounds_days[length(bounds_days)],
-                        bounds_days[length(bounds_days)])
-        probs[k, l + 1] <- 0
-      } else {
-        interval_s <- c(bounds_days[j_idx + l], bounds_days[j_idx + l + 1])
-        num <- P_Ti_Si_in_intervals_num(data$i[k],
-                                        interval_t, 
-                                        interval_s, 
-                                        lambda1,
-                                        lambda2,
-                                        theta,
-                                        grid_t = grid_t, 
-                                        grid_s = grid_s)
-        den <- P_Ti_in_interval(data$i[k], interval_t, lambda1)
-        probs[k, l + 1] <- ifelse(den > 0, num / den, 0)
-      }
-    }
-  }
-  colnames(probs) <- paste0("lag_", 0:max_lag)
-  return(probs)
-}
-
-# 7) Build complete reporting triangle 
-# Using probs matrix (n x (max_lag+1)) and event-year mapping, aggregate counts
 build_triangle_expected <- function(data, probs, years, max_lag = 5) {
-  # rows: origin years; cols: development years (0..max_lag)
   origin_years <- years
   n_years <- length(origin_years)
   triangle <- matrix(0, nrow = n_years, ncol = max_lag + 1)
-  rownames(triangle) <- as.character(origin_years)
-  colnames(triangle) <- paste0("dev_", 0:max_lag)
-  for (k in seq_len(nrow(data))) {
-    occ_year <- as.integer(format(data$AccDate[k], "%Y"))
-    j_idx <- which(origin_years == occ_year)
-    if (length(j_idx) == 0) next
-    # weight is 1 per claim (if you have monetary amounts, adapt)
-    for (l in 0:max_lag) {
-      triangle[j_idx, l + 1] <- triangle[j_idx, l + 1] + probs[k, l + 1]
-    }
+  colnames(triangle) <- as.character(origin_years)
+  rownames(triangle) <- paste0("dev_", 0:max_lag)
+
+  occ_years <- as.integer(format(data$AccDate, "%Y"))
+  year_idx <- match(occ_years, origin_years)
+
+  for (l in 0:max_lag) {
+    triangle[, l + 1] <- tapply(probs[, l + 1], year_idx, sum, default = 0)
   }
-  return(triangle)
+
+  return(t(triangle))
 }
+
 ```
 
 ```{r}
@@ -377,7 +407,26 @@ params <- res_mle$est
 print(params)
 ```
 
+```{r}
+years <- sort(unique(as.integer(format(data_p$AccDate, "%Y"))))
+probs <- compute_delay_probs(data_p, params, years, max_lag = 6)
+```
 
+
+```{r}
+# 4) Construye triángulo esperado
+tri_expected <- build_triangle_expected(data_p, probs, years, max_lag = 5)
+print(tri_expected)
+```
+
+```{r}
+tri_expected <- cumtria(tri_expected)
+n <- nrow(tri_expected)
+mask <- upper.tri(matrix(TRUE, n, n), diag = TRUE)[, n:1]  
+tri_expected[!mask] <- NA 
+tri_expected <- as.triangle(as.matrix(tri_expected))
+fds <- MackChainLadder(tri_expected)$f
+```
 
 
 
