@@ -143,291 +143,192 @@ sum(tria[,6]-diag(tria))
 ```
 
 # Estimación por cópulas
+## Intento 3
 
 ```{r}
-# 1) Preprocessing 
-prepare_times <- function(data, date_origin = NULL) {
+empirical_quantile_fun <- function(x) {
+  x <- sort(x)
+  n <- length(x)
+  p <- ((1:n) - 0.5) / n           # probs for sample quantiles
+  # return a function q(u) for u in (0,1)
+  function(u) {
+    if (any(u <= 0) || any(u >= 1)) {
+      # clamp slightly
+      u <- pmin(pmax(u, 1e-10), 1 - 1e-10)
+    }
+    approx(p, x, xout = u, rule = 2)$y
+  }
+}
+
+# ---------- 1) Prepare data (AY_cont, DY_cont, counts by origin) ----------
+prepare_ay_dy <- function(data) {
   if (!inherits(data$AccDate, "Date")) data$AccDate <- as.Date(data$AccDate)
   if (!inherits(data$ReportDate, "Date")) data$ReportDate <- as.Date(data$ReportDate)
-  if (is.null(date_origin)) date_origin <- min(data$AccDate, na.rm = TRUE)
-  data$Ti <- as.numeric(difftime(data$AccDate, date_origin, units = "days"))
-  data$Si <- as.numeric(difftime(data$ReportDate, date_origin, units = "days"))
-  stopifnot(all(data$Si >= data$Ti, na.rm = TRUE))
-  data <- data[order(data$Ti), , drop = FALSE]
-  data$i <- seq_len(nrow(data))
-  data$Tprime <- c(data$Ti[1], diff(data$Ti))
-  data$Wi <- data$Si - data$Ti
-  return(list(data = data, origin = date_origin))
+  stopifnot(all(!is.na(data$AccDate)))
+  stopifnot(all(!is.na(data$ReportDate)))
+  # continuous accident year: e.g., 2014.5 if mid-year (use day-of-year / 365)
+  doy_acc <- as.integer(format(data$AccDate, "%j"))
+  AY_cont <- as.numeric(format(data$AccDate, "%Y")) + (doy_acc - 1)/365
+  # continuous development in years (ReportDate - AccDate) in days / 365
+  DY_cont <- as.numeric(difftime(data$ReportDate, data$AccDate, units = "days")) / 365
+  if (any(DY_cont < 0)) stop("Hay registros con ReportDate < AccDate")
+  data2 <- data
+  data2$AY_cont <- AY_cont
+  data2$DY_cont <- DY_cont
+  data2$AccYear <- as.integer(format(data2$AccDate, "%Y"))
+  return(data2)
 }
 
-# 2) Marginals & Clayton
-f_exp <- function(x, lambda) {
-  y <- lambda * exp(-lambda * pmax(x, 0))
-  y[x < 0] <- 0
-  y
-}
-
-F_exp <- function(x, lambda) {
-  y <- 1 - exp(-lambda * pmax(x, 0))
-  y[x < 0] <- 0
-  y
-}
-
-c_clayton <- function(u, v, theta) {
-  if (theta <= 0) return(1.0)
-  u <- pmin(pmax(u, 1e-12), 1 - 1e-12)
-  v <- pmin(pmax(v, 1e-12), 1 - 1e-12)
-  term <- (u^(-theta) + v^(-theta) - 1)
-  (theta + 1) * (u * v)^(-theta - 1) * term^(-2 - 1 / theta)
-}
-
-# Gauss–Legendre 64-pt quadrature
-quad64 <- local({
-  x <- c(-0.960289856, -0.796666477, -0.525532410, -0.183434642,
-         0.183434642, 0.525532410, 0.796666477, 0.960289856)
-  w <- c(0.101228536, 0.222381034, 0.313706646, 0.362683783,
-         0.362683783, 0.313706646, 0.222381034, 0.101228536)
-  list(x = x, w = w)
-})
-
-# Optimized joint density
-f_TiSi <- function(t, s, i, lambda1, lambda2, theta) {
-  if (s < t) return(0)
-  
-  # i == 1: closed form
-  if (i == 1) {
-    tau <- t
-    w <- s
-    val <- f_exp(tau, lambda1) * f_exp(w, lambda2) *
-      c_clayton(F_exp(tau, lambda1), F_exp(w, lambda2), theta)
-    return(max(val, 1e-300))
+# ---------- 2) Fit copula on pseudo-observations (choice of family) ----------
+fit_copula_pobs <- function(AY_cont, DY_cont, family = c("frank","clayton","gumbel")) {
+  family <- match.arg(family)
+  n <- length(AY_cont)
+  # pseudo-observations: ranks/(n+1)
+  U <- rank(AY_cont, ties.method = "average") / (n + 1)
+  V <- rank(DY_cont, ties.method = "average") / (n + 1)
+  uv <- cbind(U, V)
+  if (family == "frank") {
+    cop <- frankCopula(dim = 2)
+  } else if (family == "clayton") {
+    cop <- claytonCopula(dim = 2)
+  } else if (family == "gumbel") {
+    cop <- gumbelCopula(dim = 2)
   }
-  
-  # Integration via 64-point Gauss-Legendre
-  a <- 0; b <- t
-  xs <- ((b - a) / 2) * quad64$x + (b + a) / 2
-  ws <- quad64$w
-  
-  tau <- t - xs
-  w <- s - xs
-  mask <- (tau >= 0) & (w >= 0)
-  if (!any(mask)) return(0)
-  
-  # vectorized integrand
-  f_tau <- f_exp(tau[mask], lambda1)
-  f_w   <- f_exp(w[mask], lambda2)
-  u1 <- F_exp(tau[mask], lambda1)
-  v1 <- F_exp(w[mask], lambda2)
-  copd <- c_clayton(u1, v1, theta)
-  f_Tim1 <- dgamma(xs[mask], shape = i - 1, rate = lambda1)
-  
-  y <- f_tau * f_w * copd * f_Tim1
-  val <- sum(ws[mask] * y) * (b - a) / 2
-  max(val, 1e-300)
+  fit <- fitCopula(cop, data = uv, method = "ml")
+  return(list(fit = fit, U = U, V = V))
 }
 
-# 4) Log-likelihood (vectorized)
-loglik_params <- function(params, data) {
-  lambda1 <- params[1]; lambda2 <- params[2]; theta <- params[3]
-  if (lambda1 <= 0 || lambda2 <= 0 || theta < 0) return(1e20)
-  
-  vals <- vapply(seq_len(nrow(data)), function(idx) {
-    f_TiSi(data$Ti[idx], data$Si[idx], data$i[idx],
-           lambda1, lambda2, theta)
-  }, numeric(1))
-  
-  if (any(vals <= 0 | !is.finite(vals))) return(1e20)
-  -sum(log(vals))
-}
-
-# 5) Estimation (MLE)
-estimate_params <- function(data, init = NULL,
-                            lower = c(1e-6, 1e-6, 0),
-                            upper = c(Inf, Inf, Inf)) {
-  if (is.null(init)) {
-    lambda1_init <- 1 / mean(pmax(data$Tprime, 1e-6))
-    lambda2_init <- 1 / mean(pmax(data$Wi, 1e-6))
-    theta_init <- 0.5
-    init <- c(lambda1_init, lambda2_init, theta_init)
-  }
-  opt <- optim(par = init,
-               fn = loglik_params,
-               data = data,
-               method = "L-BFGS-B",
-               lower = lower,
-               upper = upper,
-               control = list(maxit = 200))
-  est <- opt$par
-  names(est) <- c("lambda1", "lambda2", "theta")
-  list(est = est, optim = opt)
-}
-
-```
-
-
-```{r}
-P_Ti_in_interval <- function(i, interval, lambda1) {
-  pgamma(interval[2], shape = i, rate = lambda1) - pgamma(interval[1], shape = i, rate = lambda1)
-}
-
-# --- Numerador optimizado y "limpio" ---
-P_Ti_Si_in_intervals_num <- function(i, interval_t, interval_s, lambda1, lambda2, theta,
-                                     grid_t = 20, grid_s = 20) {
-  ts <- seq(interval_t[1], interval_t[2], length.out = grid_t)
-  ss <- seq(interval_s[1], interval_s[2], length.out = grid_s)
-  dx <- (interval_t[2] - interval_t[1]) / (grid_t - 1)
-  dy <- (interval_s[2] - interval_s[1]) / (grid_s - 1)
-  use_gamma <- (i > 1)
-
-  log_vals <- matrix(-Inf, nrow = grid_t, ncol = grid_s)
-
-  for (ii in seq_along(ts)) {
-    t <- ts[ii]
-    us <- seq(0, t, length.out = 25)  # cuadratura interna más ligera
-    for (jj in seq_along(ss)) {
-      s <- ss[jj]
-      if (s < t) next
-
-      tau <- t - us
-      w   <- s - us
-      valid <- (tau >= 0 & w >= 0)
-      if (!any(valid)) next
-
-      tau <- tau[valid]
-      w   <- w[valid]
-      u   <- us[valid]
-
-      # Componentes en log
-      log_f_tau <- log(lambda1) - lambda1 * tau
-      log_f_w   <- log(lambda2) - lambda2 * w
-      u1 <- 1 - exp(-lambda1 * tau)
-      v1 <- 1 - exp(-lambda2 * w)
-      cop <- c_clayton(u1, v1, theta)
-      log_cop <- ifelse(cop > 0, log(cop), -Inf)
-      log_f_Tim1 <- if (use_gamma) dgamma(u, shape = i - 1, rate = lambda1, log = TRUE) else 0
-
-      log_y <- log_f_tau + log_f_w + log_cop + log_f_Tim1
-
-      # corte temprano si todo es -Inf
-      if (all(!is.finite(log_y))) next
-
-      # log-sum-exp + trapecio
-      max_log <- suppressWarnings(max(log_y[is.finite(log_y)], na.rm = TRUE))
-      if (!is.finite(max_log)) next
-      val <- exp(max_log) * trapz(u, exp(log_y - max_log))
-      log_vals[ii, jj] <- log(val)
+# ---------- 3) Estimate conditional probs via simulation ----------
+estimate_conditional_probs <- function(data_prepped,
+                                       cop_fit,                      # output of fit_copula_pobs
+                                       simulate_n = 200000,
+                                       years = sort(unique(data_prepped$AccYear)),
+                                       max_lag = 6,
+                                       seed = 12345) {
+  set.seed(seed)
+  n <- nrow(data_prepped)
+  # marginals empirical quantile functions
+  q_AY <- empirical_quantile_fun(data_prepped$AY_cont)
+  q_DY <- empirical_quantile_fun(data_prepped$DY_cont)
+  # Sample from fitted copula
+  fitted_copula <- cop_fit$fit@copula
+  # NOTE: fitCopula returns an object with param set in @copula after fit
+  # simulate
+  uv_sim <- rCopula(simulate_n, fitted_copula)  # matrix (simulate_n x 2)
+  Usim <- uv_sim[,1]; Vsim <- uv_sim[,2]
+  # map to marginal scales
+  AY_sim <- q_AY(Usim)      # continuous AY
+  DY_sim <- q_DY(Vsim)      # continuous DY in years
+  # compute occ years and integer lags
+  occ_year_sim <- floor(AY_sim + 1e-9)  # year of occurrence
+  lag_sim <- floor(DY_sim + 1e-9)       # development lag in integer years
+  # restrict to years of interest
+  years_vec <- years
+  n_years <- length(years_vec)
+  probs_matrix <- matrix(0, nrow = n_years, ncol = max_lag + 1)
+  rownames(probs_matrix) <- as.character(years_vec)
+  colnames(probs_matrix) <- paste0("lag_", 0:max_lag)
+  for (i in seq_len(n_years)) {
+    a <- years_vec[i]
+    sel <- which(occ_year_sim == a)
+    if (length(sel) == 0) {
+      probs_matrix[i, ] <- 0
+    } else {
+      counts <- tabulate(pmin(lag_sim[sel], max_lag) + 1, nbins = max_lag + 1)
+      probs_matrix[i, ] <- counts / length(sel)
     }
   }
-
-  finite_vals <- log_vals[is.finite(log_vals)]
-  if (length(finite_vals) == 0) return(1e-300)
-
-  max_outer <- max(finite_vals)
-  total <- exp(max_outer) * sum(exp(log_vals - max_outer), na.rm = TRUE) * dx * dy
-  return(max(total, 1e-300))
+  return(probs_matrix)
 }
 
-# --- Cálculo de probabilidades ---
-compute_delay_probs <- function(data, params, years, max_lag = 5, grid_t = 20, grid_s = 20) {
-  lambda1 <- params[1]; lambda2 <- params[2]; theta <- params[3]
-  n <- nrow(data)
-  
-  # Precompute límites de año (una sola vez)
-  year_bounds <- as.Date(paste0(years, "-01-01"))
-  origin <- min(data$AccDate)
-  bounds_days <- as.numeric(difftime(year_bounds, origin, units = "days"))
-  bounds_days <- c(bounds_days, tail(bounds_days, 1) + 365)
-  
-  # Precompute intervalos
-  year_intervals <- lapply(seq_along(years), function(j) {
-    c(bounds_days[j], bounds_days[j + 1])
-  })
-  
-  # Progreso sobre índices, preservando tipos originales
-  probs <- pbapply::pbmapply(function(k) {
-    occ_year <- as.integer(format(data$AccDate[k], "%Y"))
-    j_idx <- which(years == occ_year)
-    if (length(j_idx) == 0) return(rep(0, max_lag + 1))
-    
-    i_val <- data$i[k]
-    interval_t <- year_intervals[[j_idx]]
-    den <- P_Ti_in_interval(i_val, interval_t, lambda1)
-    if (den <= 0) return(rep(0, max_lag + 1))
-    
-    p_row <- numeric(max_lag + 1)
-    for (l in 0:max_lag) {
-      if ((j_idx + l) > length(years)) {
-        p_row[l + 1] <- 0
-      } else {
-        interval_s <- year_intervals[[j_idx + l]]
-        num <- P_Ti_Si_in_intervals_num(i_val, interval_t, interval_s,
-                                        lambda1, lambda2, theta,
-                                        grid_t = grid_t, grid_s = grid_s)
-        p_row[l + 1] <- num / den
-      }
-    }
-    return(p_row)
-  }, k = seq_len(n), SIMPLIFY = FALSE)
-  
-  # Convertir lista a matriz
-  probs <- do.call(rbind, probs)
-  colnames(probs) <- paste0("lag_", 0:max_lag)
-  return(probs)
-}
-```
-
-
-```{r}
-# 7) Construcción del triángulo
-
-build_triangle_expected <- function(data, probs, years, max_lag = 5) {
-  origin_years <- years
-  n_years <- length(origin_years)
+# ---------- 4) Build expected triangle (counts) ----------
+build_triangle_from_probs <- function(data_prepped, probs_matrix, years = sort(unique(data_prepped$AccYear)), max_lag = 6) {
+  n_years <- length(years)
   triangle <- matrix(0, nrow = n_years, ncol = max_lag + 1)
-  colnames(triangle) <- as.character(origin_years)
-  rownames(triangle) <- paste0("dev_", 0:max_lag)
-
-  occ_years <- as.integer(format(data$AccDate, "%Y"))
-  year_idx <- match(occ_years, origin_years)
-
-  for (l in 0:max_lag) {
-    triangle[, l + 1] <- tapply(probs[, l + 1], year_idx, sum, default = 0)
+  rownames(triangle) <- as.character(years)
+  colnames(triangle) <- paste0("dev_", 0:max_lag)
+  # counts per origin year
+  counts <- as.integer(table(factor(data_prepped$AccYear, levels = years)))
+  for (i in seq_len(n_years)) {
+    triangle[i, ] <- counts[i] * probs_matrix[i, ]
   }
-
-  return(t(triangle))
+  return(list(triangle = triangle, counts = counts))
 }
 
+build_triangle_from_probs_amount <- function(data_prepped,
+                                             probs_matrix,
+                                             years = sort(unique(data_prepped$AccYear)),
+                                             max_lag = 6,
+                                             amount_col = "AggClaim") {
+  
+  n_years <- length(years)
+  triangle <- matrix(0, nrow = n_years, ncol = max_lag + 1)
+  rownames(triangle) <- as.character(years)
+  colnames(triangle) <- paste0("dev_", 0:max_lag)
+  
+  # sum of amounts per origin year
+  # e.g. total incurred or agg claim in the origin year
+  sums <- tapply(data_prepped[[amount_col]],
+                 factor(data_prepped$AccYear, levels = years),
+                 sum)
+  
+  # fill the triangle
+  for (i in seq_len(n_years)) {
+    triangle[i, ] <- sums[i] * probs_matrix[i, ]
+  }
+  
+  return(list(triangle_amount = triangle, origin_amount = sums))
+}
+
+# ---------- 5) High-level wrapper ----------
+estimate_copula_runoff <- function(data,
+                                   family = c("frank","clayton","gumbel"),
+                                   simulate_n = 200000,
+                                   max_lag = 6,
+                                   seed = 12345) {
+  family <- match.arg(family)
+  data_p <- prepare_ay_dy(data)
+  years <- sort(unique(data_p$AccYear))
+  # fit copula
+  fit_obj <- fit_copula_pobs(data_p$AY_cont, data_p$DY_cont, family = family)
+  # estimate probs via simulation
+  probs <- estimate_conditional_probs(data_p, fit_obj, simulate_n = simulate_n, years = years, max_lag = max_lag, seed = seed)
+  tri_out <- build_triangle_from_probs(data_p, probs, years = years, max_lag = max_lag)
+  tri_amt_out <- build_triangle_from_probs_amount(data_p, probs,
+                                                years = years,
+                                                max_lag = max_lag,
+                                                amount_col = "AggClaim")
+  out <- list(
+    params = fit_obj$fit,
+    family = family,
+    probs = probs,
+    triangle_expected_counts = tri_out$triangle,
+    triangle_expected_amounts = tri_amt_out$triangle_amount,
+    origin_counts = tri_out$counts,
+    origin_amounts = tri_amt_out$origin_amount,
+    data_prepped = data_p
+  )
+  return(out)
+}
 ```
 
 ```{r}
-prep <- prepare_times(data)
-data_p <- prep$data
-res_mle <- estimate_params(data_p)
-params <- res_mle$est
-print(params)
+out <- estimate_copula_runoff(data, family = "frank", simulate_n = 200000, max_lag = 5)
+out$probs                
+out$triangle_expected_counts
 ```
 
 ```{r}
-years <- sort(unique(as.integer(format(data_p$AccDate, "%Y"))))
-probs <- compute_delay_probs(data_p, params, years, max_lag = 6)
-```
-
-
-```{r}
-# 4) Construye triángulo esperado
-tri_expected <- build_triangle_expected(data_p, probs, years, max_lag = 5)
-print(tri_expected)
+out$triangle_expected_amounts
 ```
 
 ```{r}
-tri_expected <- cumtria(tri_expected)
-n <- nrow(tri_expected)
-mask <- upper.tri(matrix(TRUE, n, n), diag = TRUE)[, n:1]  
-tri_expected[!mask] <- NA 
-tri_expected <- as.triangle(as.matrix(tri_expected))
-fds <- MackChainLadder(tri_expected)$f
+(final <- t(apply(out$triangle_expected_amounts, 1, cumsum)))
 ```
 
+```{r}
+sum(final[,6]-diag(final))
+```
 
 
 
