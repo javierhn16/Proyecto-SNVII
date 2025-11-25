@@ -26,9 +26,7 @@ pacman::p_load(
   stats,
   zoo,
   pbapply,
-  pracma,
-  knitr,
-  kableExtra
+  pracma
 )
 ```
 
